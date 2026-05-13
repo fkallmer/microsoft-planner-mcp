@@ -137,10 +137,10 @@ mcp.addTool({
   },
 });
 
-// Tool: Update task (title, percentComplete, assignments, categories)
+// Tool: Update task (title, percentComplete, assignments, categories, priority)
 mcp.addTool({
   name: "update-task",
-  description: "Update task properties (title, progress, assignments, categories, due date). Auto-fetches ETag.",
+  description: "Update task properties (title, progress, assignments, categories, due date, priority). Auto-fetches ETag.",
   parameters: z.object({
     taskId: z.string().describe("The task ID"),
     title: z.string().optional().describe("New title"),
@@ -149,12 +149,14 @@ mcp.addTool({
     category: z.string().optional().describe("Category to apply (category1-category25)"),
     removeCategory: z.string().optional().describe("Category to remove (category1-category25)"),
     dueDateTime: z.string().optional().describe("Due date (ISO 8601 format, e.g., '2024-12-31' or '2024-12-31T17:00:00Z'). Use 'clear' to remove due date."),
+    priority: z.number().min(0).max(10).optional().describe("Priority: 1=urgent, 3=important, 5=medium, 9=low"),
   }),
-  execute: async ({ taskId, title, percentComplete, assignUserId, category, removeCategory, dueDateTime }) => {
+  execute: async ({ taskId, title, percentComplete, assignUserId, category, removeCategory, dueDateTime, priority }) => {
     const etag = getETag("task", taskId);
     const body: Record<string, any> = {};
     if (title !== undefined) body.title = title;
     if (percentComplete !== undefined) body.percentComplete = percentComplete;
+    if (priority !== undefined) body.priority = priority;
     if (assignUserId) {
       body.assignments = {
         [assignUserId]: {

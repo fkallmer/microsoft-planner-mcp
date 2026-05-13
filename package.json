@@ -12,8 +12,9 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
-    "fastmcp": "^3.25.3",
-    "zod": "^4.1.13"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "fastmcp": "^4.0.1",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
