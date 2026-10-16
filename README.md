@@ -85,8 +85,7 @@ Or add directly to your MCP settings file:
 ### Comments
 | Tool | Description |
 |------|-------------|
-| `get-task-comments` | Get all comments on a task |
-| `add-task-comment` | Add a comment to a task (creates thread if needed) |
+| `get-task-comments` | Read Task Chat comments of a task (Graph beta, read-only) |
 
 ### References & Attachments
 | Tool | Description |
@@ -157,7 +156,6 @@ Once configured, use natural language with Claude Code:
 "Who can I assign tasks to?"
 "Assign this task to Joe"
 "Move this task to the 'In Progress' bucket"
-"Add a comment to this task: 'Waiting on API team'"
 "Show me the comments on this task"
 "Attach this GitHub PR link to the task"
 "Upload /path/to/data-export.csv to this task"

@@ -54,6 +54,20 @@ function azRest(method: string, url: string, body?: object): string {
   return az(method, url, { body });
 }
 
+// GET a Graph collection and follow @odata.nextLink until every page is loaded.
+// Graph pages large collections; reading only result.value silently drops the rest.
+// (Idea from camtarn/microsoft-planner-mcp; no shell here, so $skiptoken needs no escaping.)
+function azRestGetAll(url: string): any[] {
+  const items: any[] = [];
+  let next: string | undefined = url;
+  while (next) {
+    const result = JSON.parse(azRest("GET", next));
+    items.push(...(result.value ?? []));
+    next = result["@odata.nextLink"];
+  }
+  return items;
+}
+
 // Helper to get ETag for update/delete operations (supports multiple resource types)
 type ResourceType = "task" | "taskDetails" | "bucket";
 
@@ -102,8 +116,7 @@ mcp.addTool({
   }),
   execute: async ({ planId }) => {
     const url = `https://graph.microsoft.com/v1.0/planner/plans/${seg(planId)}/tasks`;
-    const result = JSON.parse(azRest("GET", url));
-    return JSON.stringify(result.value, null, 2);
+    return JSON.stringify(azRestGetAll(url), null, 2);
   },
 });
 
@@ -369,8 +382,7 @@ mcp.addTool({
   }),
   execute: async ({ planId }) => {
     const url = `https://graph.microsoft.com/v1.0/planner/plans/${seg(planId)}/buckets`;
-    const result = JSON.parse(azRest("GET", url));
-    return JSON.stringify(result.value, null, 2);
+    return JSON.stringify(azRestGetAll(url), null, 2);
   },
 });
 
@@ -381,8 +393,7 @@ mcp.addTool({
   parameters: z.object({}),
   execute: async () => {
     const url = "https://graph.microsoft.com/v1.0/me/planner/plans";
-    const result = JSON.parse(azRest("GET", url));
-    return JSON.stringify(result.value, null, 2);
+    return JSON.stringify(azRestGetAll(url), null, 2);
   },
 });
 
@@ -407,8 +418,7 @@ mcp.addTool({
   parameters: z.object({}),
   execute: async () => {
     const url = "https://graph.microsoft.com/v1.0/me/planner/tasks";
-    const result = JSON.parse(azRest("GET", url));
-    return JSON.stringify(result.value, null, 2);
+    return JSON.stringify(azRestGetAll(url), null, 2);
   },
 });
 
@@ -422,9 +432,8 @@ mcp.addTool({
   execute: async ({ planId }) => {
     const groupId = getGroupIdFromPlan(planId);
     const url = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/members`;
-    const result = JSON.parse(azRest("GET", url));
     // Return simplified list with id and displayName
-    const members = result.value.map((m: any) => ({
+    const members = azRestGetAll(url).map((m: any) => ({
       id: m.id,
       displayName: m.displayName,
       userPrincipalName: m.userPrincipalName,
@@ -433,117 +442,24 @@ mcp.addTool({
   },
 });
 
-// Tool: Get task comments
+// Tool: Get task comments from the new Planner "Task Chat" (beta API).
+// The legacy comments lived in the plan's Microsoft 365 group mailbox; writing one sent a mail
+// to the whole group, so there is deliberately no tool to add comments here.
 mcp.addTool({
   name: "get-task-comments",
-  description: "Get all comments on a Planner task",
+  description: "Read the Task Chat comments of a Planner task (Microsoft Graph beta). Returns an empty list if the task has no chat yet. Adding comments is not supported.",
   parameters: z.object({
     taskId: z.string().describe("The task ID"),
   }),
   execute: async ({ taskId }) => {
-    // Get task to find conversationThreadId and planId
-    const taskUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;
-    const task = JSON.parse(azRest("GET", taskUrl));
-
-    if (!task.conversationThreadId) {
-      return JSON.stringify({ comments: [], message: "No comments on this task" });
-    }
-
-    const groupId = getGroupIdFromPlan(task.planId);
-
-    // Planner's conversationThreadId is a conversation ID - get threads from it, then posts
-    const threadsUrl = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/conversations/${seg(task.conversationThreadId)}/threads`;
-    const threadsResult = JSON.parse(azRest("GET", threadsUrl));
-
-    // Collect posts from all threads
-    const comments: any[] = [];
-    for (const thread of threadsResult.value) {
-      const postsUrl = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/conversations/${seg(task.conversationThreadId)}/threads/${seg(thread.id)}/posts`;
-      const postsResult = JSON.parse(azRest("GET", postsUrl));
-
-      for (const post of postsResult.value) {
-        comments.push({
-          id: post.id,
-          threadId: thread.id,
-          content: post.body?.content,
-          contentType: post.body?.contentType,
-          createdDateTime: post.createdDateTime,
-          from: post.from?.emailAddress?.name || post.from?.emailAddress?.address,
-        });
+    const url = `https://graph.microsoft.com/beta/planner/tasks/${seg(taskId)}/messages`;
+    try {
+      return JSON.stringify(azRestGetAll(url), null, 2);
+    } catch (error: any) {
+      if (String(error.message).includes("does not have an associated chat thread")) {
+        return JSON.stringify([], null, 2);
       }
-    }
-
-    return JSON.stringify(comments, null, 2);
-  },
-});
-
-// Tool: Add task comment
-mcp.addTool({
-  name: "add-task-comment",
-  description: "Add a comment to a Planner task",
-  parameters: z.object({
-    taskId: z.string().describe("The task ID"),
-    comment: z.string().describe("The comment text to add"),
-  }),
-  execute: async ({ taskId, comment }) => {
-    // Get task to find conversationThreadId and planId
-    const taskUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;
-    const task = JSON.parse(azRest("GET", taskUrl));
-    const groupId = getGroupIdFromPlan(task.planId);
-
-    if (task.conversationThreadId) {
-      // Reply to existing conversation - need to get the thread ID first
-      const threadsUrl = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/conversations/${seg(task.conversationThreadId)}/threads`;
-      const threadsResult = JSON.parse(azRest("GET", threadsUrl));
-
-      if (!threadsResult.value || threadsResult.value.length === 0) {
-        throw new Error("Conversation exists but has no threads");
-      }
-
-      const threadId = threadsResult.value[0].id;
-      const replyUrl = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/conversations/${seg(task.conversationThreadId)}/threads/${seg(threadId)}/reply`;
-      const body = {
-        post: {
-          body: {
-            contentType: "text",
-            content: comment,
-          },
-        },
-      };
-      azRest("POST", replyUrl, body);
-      return JSON.stringify({ success: true, message: "Comment added to existing thread" });
-    } else {
-      // Create new conversation (POST to threads creates a conversation with initial thread)
-      const threadsUrl = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/threads`;
-      const threadBody = {
-        topic: task.title,
-        posts: [
-          {
-            body: {
-              contentType: "text",
-              content: comment,
-            },
-          },
-        ],
-      };
-      const threadResult = JSON.parse(azRest("POST", threadsUrl, threadBody));
-      // Graph API returns conversationId for the parent conversation - that's what Planner needs
-      const conversationId = threadResult.conversationId || threadResult.id;
-
-      // Update task with the conversation ID
-      const etag = getETag("task", taskId);
-      const updateUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;
-      try {
-        az("PATCH", updateUrl, { etag, body: { conversationThreadId: conversationId } });
-      } catch (error: any) {
-        // Thread was created but task update may fail - comment still exists
-        return JSON.stringify({
-          success: true,
-          warning: "Thread created but task link may have failed",
-          conversationId
-        });
-      }
-      return JSON.stringify({ success: true, message: "New conversation created", conversationId });
+      throw error;
     }
   },
 });
