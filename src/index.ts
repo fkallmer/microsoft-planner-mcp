@@ -183,7 +183,7 @@ mcp.addTool({
     if (category || removeCategory) {
       body.appliedCategories = {};
       if (category) body.appliedCategories[category] = true;
-      if (removeCategory) body.appliedCategories[removeCategory] = null;
+      if (removeCategory) body.appliedCategories[removeCategory] = false;  // Graph erwartet false, null ist ungültig
     }
     if (dueDateTime) {
       if (dueDateTime.toLowerCase() === "clear") {
