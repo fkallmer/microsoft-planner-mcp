@@ -85,6 +85,8 @@ Or add directly to your MCP settings file:
 ### Comments
 | Tool | Description |
 |------|-------------|
+| `get-plan-overview` | Whole plan in one call: categories, buckets, tasks with ETags, optional details |
+| `update-tasks` | Update many tasks in parallel (max 5 at a time), result per task |
 | `get-task-comments` | Read Task Chat comments of a task (Graph beta, read-only) |
 
 ### References & Attachments

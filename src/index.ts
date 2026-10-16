@@ -2,9 +2,8 @@ import { FastMCP } from "fastmcp";
 import { z } from "zod";
 import { execFileSync } from "child_process";
 import { randomUUID } from "crypto";
-import { writeFileSync, unlinkSync, readFileSync } from "fs";
-import { tmpdir } from "os";
-import { join, basename } from "path";
+import { readFileSync } from "fs";
+import { basename } from "path";
 
 const mcp = new FastMCP({
   name: "microsoft-planner-mcp",
@@ -15,53 +14,75 @@ const mcp = new FastMCP({
 // (e.g. "abc/../../users" or "?$select=...").
 const seg = (value: string) => encodeURIComponent(value);
 
-interface AzOptions {
+interface GraphOptions {
   body?: object;            // JSON body
-  bodyFile?: string;        // raw body from a file (e.g. upload)
+  raw?: Buffer;             // raw body (e.g. file upload)
   etag?: string;            // sent as If-Match
   contentType?: string;
+  prefer?: string;          // e.g. "return=representation": PATCH returns the updated object
 }
 
-// Run `az rest` without a shell: arguments are passed as an array, so titles, comments or
-// IDs containing quotes, $(...) or backticks are never interpreted. JSON bodies always go
-// through a temp file, which also avoids any quoting of the payload.
-function az(method: string, url: string, opts: AzOptions = {}): string {
-  const args = ["rest", "--method", method, "--url", url];
-  const headers: string[] = [];
-  let tmpFile: string | undefined;
-  if (opts.body !== undefined) {
-    tmpFile = join(tmpdir(), `mcp-planner-${randomUUID()}.json`);
-    writeFileSync(tmpFile, JSON.stringify(opts.body));
-    headers.push(`Content-Type=${opts.contentType ?? "application/json"}`);
-    args.push("--body", `@${tmpFile}`);
-  } else if (opts.bodyFile) {
-    headers.push(`Content-Type=${opts.contentType ?? "application/octet-stream"}`);
-    args.push("--body", `@${opts.bodyFile}`);
-  }
-  if (opts.etag) headers.push(`If-Match=${opts.etag}`);
-  if (headers.length) args.push("--headers", ...headers);
+// Graph token from the Azure CLI (same login as `az rest`), fetched once and reused until shortly
+// before it expires. Starting `az` for every request cost ~0.4 s; a direct request takes ~0.15 s.
+// No shell is involved: execFileSync gets an argument array, fetch gets the payload as data.
+let tokenCache: { token: string; ablauf: number } | null = null;
+
+function graphToken(): string {
+  if (tokenCache && Date.now() < tokenCache.ablauf - 5 * 60_000) return tokenCache.token;
+  let out: string;
   try {
-    return execFileSync("az", args, { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
+    out = execFileSync("az", ["account", "get-access-token", "--resource", "https://graph.microsoft.com", "-o", "json"],
+      { encoding: "utf-8" });
   } catch (error: any) {
-    throw new Error(`az rest failed: ${error.stderr?.toString().trim() || error.message}`);
-  } finally {
-    if (tmpFile) try { unlinkSync(tmpFile); } catch {}
+    throw new Error(`No Graph token from the Azure CLI (run az login): ${error.stderr?.toString().trim() || error.message}`);
+  }
+  const t = JSON.parse(out);
+  const ablauf = t.expires_on ? Number(t.expires_on) * 1000 : Date.parse(t.expiresOn);
+  tokenCache = { token: t.accessToken, ablauf };
+  return t.accessToken;
+}
+
+async function graph(method: string, url: string, opts: GraphOptions = {}): Promise<string> {
+  for (let versuch = 0; ; versuch++) {
+    const headers: Record<string, string> = { Authorization: `Bearer ${graphToken()}` };
+    let body: string | Blob | undefined;
+    if (opts.body !== undefined) {
+      headers["Content-Type"] = opts.contentType ?? "application/json";
+      body = JSON.stringify(opts.body);
+    } else if (opts.raw) {
+      headers["Content-Type"] = opts.contentType ?? "application/octet-stream";
+      body = new Blob([new Uint8Array(opts.raw)]);
+    }
+    if (opts.etag) headers["If-Match"] = opts.etag;
+    if (opts.prefer) headers["Prefer"] = opts.prefer;
+    const res = await fetch(url, { method, headers, body });
+    // Token revoked or expired early: fetch a fresh one once
+    if (res.status === 401 && versuch === 0) { tokenCache = null; continue; }
+    // Throttling: honour Retry-After a few times (matters for parallel requests)
+    if ((res.status === 429 || res.status === 503) && versuch < 3) {
+      const warte = Math.min(Number(res.headers.get("Retry-After") ?? 1) || 1, 10);
+      await new Promise(r => setTimeout(r, warte * 1000));
+      continue;
+    }
+    const text = await res.text();
+    if (!res.ok) throw new Error(`Graph ${method} failed (${res.status}): ${text.slice(0, 500)}`);
+    return text;
   }
 }
 
 // Kept for the existing call sites
-function azRest(method: string, url: string, body?: object): string {
-  return az(method, url, { body });
+async function azRest(method: string, url: string, body?: object): Promise<string> {
+  return graph(method, url, { body });
 }
 
 // GET a Graph collection and follow @odata.nextLink until every page is loaded.
 // Graph pages large collections; reading only result.value silently drops the rest.
 // (Idea from camtarn/microsoft-planner-mcp; no shell here, so $skiptoken needs no escaping.)
-function azRestGetAll(url: string): any[] {
+async function azRestGetAll(url: string): Promise<any[]> {
   const items: any[] = [];
   let next: string | undefined = url;
   while (next) {
-    const result = JSON.parse(azRest("GET", next));
+    const result = JSON.parse(await azRest("GET", next));
     items.push(...(result.value ?? []));
     next = result["@odata.nextLink"];
   }
@@ -71,20 +92,20 @@ function azRestGetAll(url: string): any[] {
 // Helper to get ETag for update/delete operations (supports multiple resource types)
 type ResourceType = "task" | "taskDetails" | "bucket";
 
-function getETag(resourceType: ResourceType, resourceId: string): string {
+async function getETag(resourceType: ResourceType, resourceId: string): Promise<string> {
   const urlMap: Record<ResourceType, string> = {
     task: `https://graph.microsoft.com/v1.0/planner/tasks/${seg(resourceId)}`,
     taskDetails: `https://graph.microsoft.com/v1.0/planner/tasks/${seg(resourceId)}/details`,
     bucket: `https://graph.microsoft.com/v1.0/planner/buckets/${seg(resourceId)}`,
   };
-  const result = JSON.parse(azRest("GET", urlMap[resourceType]));
+  const result = JSON.parse(await azRest("GET", urlMap[resourceType]));
   return result["@odata.etag"];
 }
 
 // Helper to get groupId from a plan (required for comments and group member listing)
-function getGroupIdFromPlan(planId: string): string {
+async function getGroupIdFromPlan(planId: string): Promise<string> {
   const url = `https://graph.microsoft.com/v1.0/planner/plans/${seg(planId)}`;
-  const result = JSON.parse(azRest("GET", url));
+  const result = JSON.parse(await azRest("GET", url));
   return result.container.containerId;
 }
 
@@ -103,8 +124,8 @@ function encodeUrlForReference(url: string): string {
 }
 
 // Helper for PATCH requests with an ETag
-function azRestPatchWithEtag(url: string, etag: string, body: object): string {
-  return az("PATCH", url, { etag, body });
+async function azRestPatchWithEtag(url: string, etag: string, body: object): Promise<string> {
+  return graph("PATCH", url, { etag, body });
 }
 
 // Tool: List tasks for a plan
@@ -116,7 +137,7 @@ mcp.addTool({
   }),
   execute: async ({ planId }) => {
     const url = `https://graph.microsoft.com/v1.0/planner/plans/${seg(planId)}/tasks`;
-    return JSON.stringify(azRestGetAll(url), null, 2);
+    return JSON.stringify(await azRestGetAll(url), null, 2);
   },
 });
 
@@ -129,7 +150,7 @@ mcp.addTool({
   }),
   execute: async ({ taskId }) => {
     const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;
-    const result = azRest("GET", url);
+    const result = await azRest("GET", url);
     return result;
   },
 });
@@ -143,7 +164,7 @@ mcp.addTool({
   }),
   execute: async ({ taskId }) => {
     const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;
-    const result = azRest("GET", url);
+    const result = await azRest("GET", url);
     return result;
   },
 });
@@ -160,59 +181,143 @@ mcp.addTool({
   execute: async ({ planId, bucketId, title }) => {
     const url = "https://graph.microsoft.com/v1.0/planner/tasks";
     const body = { planId, bucketId, title };
-    const result = azRest("POST", url, body);
+    const result = await azRest("POST", url, body);
     return result;
   },
 });
 
-// Tool: Update task (title, percentComplete, assignments, categories, priority)
+// Fields shared by update-task and update-tasks
+const TaskUpdateFields = {
+  title: z.string().optional().describe("New title"),
+  percentComplete: z.number().min(0).max(100).optional().describe("Progress 0-100"),
+  assignUserId: z.string().optional().describe("User ID to assign"),
+  category: z.string().optional().describe("Category to apply (category1-category25)"),
+  removeCategory: z.string().optional().describe("Category to remove (category1-category25)"),
+  dueDateTime: z.string().optional().describe("Due date (ISO 8601 format, e.g., '2024-12-31' or '2024-12-31T17:00:00Z'). Use 'clear' to remove due date."),
+  priority: z.number().min(0).max(10).optional().describe("Priority: 1=urgent, 3=important, 5=medium, 9=low"),
+  bucketId: z.string().optional().describe("Move the task to this bucket"),
+  etag: z.string().optional().describe("ETag from a previous read (list-tasks, get-plan-overview); saves one request"),
+};
+
+type TaskUpdate = { taskId: string } & { [K in keyof typeof TaskUpdateFields]?: any };
+
+function taskUpdateBody(u: TaskUpdate): Record<string, any> {
+  const body: Record<string, any> = {};
+  if (u.title !== undefined) body.title = u.title;
+  if (u.percentComplete !== undefined) body.percentComplete = u.percentComplete;
+  if (u.priority !== undefined) body.priority = u.priority;
+  if (u.bucketId) body.bucketId = u.bucketId;
+  if (u.assignUserId) {
+    body.assignments = { [u.assignUserId]: { "@odata.type": "#microsoft.graph.plannerAssignment", orderHint: " !" } };
+  }
+  if (u.category || u.removeCategory) {
+    body.appliedCategories = {};
+    if (u.category) body.appliedCategories[u.category] = true;
+    if (u.removeCategory) body.appliedCategories[u.removeCategory] = false;  // Graph erwartet false, null ist ungültig
+  }
+  if (u.dueDateTime) {
+    // A plain date (YYYY-MM-DD) becomes end of day UTC
+    body.dueDateTime = u.dueDateTime.toLowerCase() === "clear" ? null
+      : u.dueDateTime.includes("T") ? u.dueDateTime : `${u.dueDateTime}T23:59:59Z`;
+  }
+  return body;
+}
+
+// PATCH a task: uses the given ETag (or fetches one), retries once with a fresh ETag if it was
+// stale (412), and returns the updated task (Prefer: return=representation, no extra read).
+async function patchTask(u: TaskUpdate): Promise<any> {
+  const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(u.taskId)}`;
+  const body = taskUpdateBody(u);
+  let etag = u.etag ?? await getETag("task", u.taskId);
+  for (let versuch = 0; ; versuch++) {
+    try {
+      const text = await graph("PATCH", url, { etag, body, prefer: "return=representation" });
+      return text ? JSON.parse(text) : { id: u.taskId };
+    } catch (error: any) {
+      if (versuch === 0 && String(error.message).includes("(412)")) { etag = await getETag("task", u.taskId); continue; }
+      throw error;
+    }
+  }
+}
+
+// Tool: Update task (title, percentComplete, assignments, categories, priority, bucket)
 mcp.addTool({
   name: "update-task",
-  description: "Update task properties (title, progress, assignments, categories, due date, priority). Auto-fetches ETag.",
-  parameters: z.object({
-    taskId: z.string().describe("The task ID"),
-    title: z.string().optional().describe("New title"),
-    percentComplete: z.number().min(0).max(100).optional().describe("Progress 0-100"),
-    assignUserId: z.string().optional().describe("User ID to assign"),
-    category: z.string().optional().describe("Category to apply (category1-category25)"),
-    removeCategory: z.string().optional().describe("Category to remove (category1-category25)"),
-    dueDateTime: z.string().optional().describe("Due date (ISO 8601 format, e.g., '2024-12-31' or '2024-12-31T17:00:00Z'). Use 'clear' to remove due date."),
-    priority: z.number().min(0).max(10).optional().describe("Priority: 1=urgent, 3=important, 5=medium, 9=low"),
-  }),
-  execute: async ({ taskId, title, percentComplete, assignUserId, category, removeCategory, dueDateTime, priority }) => {
-    const etag = getETag("task", taskId);
-    const body: Record<string, any> = {};
-    if (title !== undefined) body.title = title;
-    if (percentComplete !== undefined) body.percentComplete = percentComplete;
-    if (priority !== undefined) body.priority = priority;
-    if (assignUserId) {
-      body.assignments = {
-        [assignUserId]: {
-          "@odata.type": "#microsoft.graph.plannerAssignment",
-          orderHint: " !",
-        },
-      };
-    }
-    if (category || removeCategory) {
-      body.appliedCategories = {};
-      if (category) body.appliedCategories[category] = true;
-      if (removeCategory) body.appliedCategories[removeCategory] = false;  // Graph erwartet false, null ist ungültig
-    }
-    if (dueDateTime) {
-      if (dueDateTime.toLowerCase() === "clear") {
-        body.dueDateTime = null;
-      } else {
-        // If just a date is provided (YYYY-MM-DD), append time for end of day UTC
-        body.dueDateTime = dueDateTime.includes("T") ? dueDateTime : `${dueDateTime}T23:59:59Z`;
-      }
-    }
-
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;    try {
-      const result = az("PATCH", url, { etag, body: body });
-      return result || "Task updated successfully";
+  description: "Update task properties (title, progress, assignments, categories, due date, priority, bucket). Pass etag from a previous read to save a request. Returns the updated task.",
+  parameters: z.object({ taskId: z.string().describe("The task ID"), ...TaskUpdateFields }),
+  execute: async (u) => {
+    try {
+      return JSON.stringify(await patchTask(u), null, 2);
     } catch (error: any) {
       throw new Error(`Update failed: ${error.message}`);
     }
+  },
+});
+
+// Tool: Update many tasks at once (in parallel, at most 5 at a time)
+mcp.addTool({
+  name: "update-tasks",
+  description: "Update several tasks in one call (e.g. mark many as done). Runs up to 5 updates in parallel and reports the result per task; one failure does not stop the others.",
+  parameters: z.object({
+    updates: z.array(z.object({ taskId: z.string().describe("The task ID"), ...TaskUpdateFields })).min(1).max(100),
+  }),
+  execute: async ({ updates }) => {
+    const ergebnisse: any[] = new Array(updates.length);
+    let naechster = 0;
+    const arbeiter = async () => {
+      while (naechster < updates.length) {
+        const i = naechster++;
+        try {
+          const t = await patchTask(updates[i]);
+          ergebnisse[i] = { taskId: updates[i].taskId, ok: true, title: t.title, percentComplete: t.percentComplete };
+        } catch (error: any) {
+          ergebnisse[i] = { taskId: updates[i].taskId, ok: false, error: String(error.message).slice(0, 300) };
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(5, updates.length) }, arbeiter));
+    return JSON.stringify({ ok: ergebnisse.filter(e => e.ok).length, failed: ergebnisse.filter(e => !e.ok).length, results: ergebnisse }, null, 2);
+  },
+});
+
+// Tool: Whole plan in one call (plan categories, buckets, tasks, optional details), loaded in parallel
+mcp.addTool({
+  name: "get-plan-overview",
+  description: "Get a whole plan in one call: category names, buckets in board order, and all tasks per bucket (with ETags for fast updates). With includeDetails the description and checklist of every task are included (one request via $expand=details).",
+  parameters: z.object({
+    planId: z.string().describe("The Planner plan ID"),
+    includeDetails: z.boolean().optional().default(false).describe("Include description and checklist of each task"),
+    includeCompleted: z.boolean().optional().default(true).describe("Include completed tasks"),
+  }),
+  execute: async ({ planId, includeDetails, includeCompleted }) => {
+    const basis = `https://graph.microsoft.com/v1.0/planner/plans/${seg(planId)}`;
+    const [plan, details, buckets, tasks] = await Promise.all([
+      azRest("GET", basis).then(JSON.parse),
+      azRest("GET", `${basis}/details`).then(JSON.parse),
+      azRestGetAll(`${basis}/buckets`),
+      azRestGetAll(`${basis}/tasks${includeDetails ? "?$expand=details" : ""}`),
+    ]);
+    const kategorien: Record<string, string> = details.categoryDescriptions ?? {};
+    // Planner sorts ascending by orderHint (ordinal string comparison), like the board
+    const reihenfolge = (a: any, b: any) => (a.orderHint < b.orderHint ? -1 : a.orderHint > b.orderHint ? 1 : 0);
+    const kurz = (t: any) => ({
+      id: t.id, etag: t["@odata.etag"], title: t.title, percentComplete: t.percentComplete, priority: t.priority,
+      dueDateTime: t.dueDateTime, assignees: Object.keys(t.assignments ?? {}).length,
+      categories: Object.entries(t.appliedCategories ?? {}).filter(([, v]) => v).map(([k]) => kategorien[k] || k),
+      ...(includeDetails && t.details ? {
+        description: t.details.description || undefined,
+        checklist: Object.values(t.details.checklist ?? {}).map((c: any) => ({ title: c.title, done: c.isChecked })),
+      } : {}),
+    });
+    const sichtbar = tasks.filter(t => includeCompleted || t.percentComplete < 100);
+    return JSON.stringify({
+      plan: { id: plan.id, title: plan.title, categories: kategorien },
+      total: tasks.length, open: tasks.filter(t => t.percentComplete < 100).length,
+      buckets: buckets.sort(reihenfolge).map(b => ({
+        id: b.id, name: b.name,
+        tasks: sichtbar.filter(t => t.bucketId === b.id).sort(reihenfolge).map(kurz),
+      })),
+    }, null, 2);
   },
 });
 
@@ -223,11 +328,13 @@ mcp.addTool({
   parameters: z.object({
     taskId: z.string().describe("The task ID"),
     description: z.string().describe("Task description (supports markdown, include GitHub URLs)"),
+    etag: z.string().optional().describe("ETag of the task details from a previous read; saves one request"),
   }),
-  execute: async ({ taskId, description }) => {
-    const etag = getETag("taskDetails", taskId);
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;    try {
-      const result = az("PATCH", url, { etag, body: { description } });
+  execute: async ({ taskId, description, etag: bekannt }) => {
+    const etag = bekannt ?? await getETag("taskDetails", taskId);
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;
+    try {
+      const result = await graph("PATCH", url, { etag, body: { description } });
       return result || "Task details updated successfully";
     } catch (error: any) {
       throw new Error(`Update details failed: ${error.message}`);
@@ -245,7 +352,7 @@ mcp.addTool({
     isChecked: z.boolean().optional().default(false).describe("Whether the item is checked"),
   }),
   execute: async ({ taskId, title, isChecked }) => {
-    const etag = getETag("taskDetails", taskId);
+    const etag = await getETag("taskDetails", taskId);
     const itemId = randomUUID();
     const body = {
       checklist: {
@@ -257,8 +364,9 @@ mcp.addTool({
       },
     };
 
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;    try {
-      const result = az("PATCH", url, { etag, body: body });
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;
+    try {
+      const result = await graph("PATCH", url, { etag, body: body });
       return result || JSON.stringify({ success: true, itemId, title });
     } catch (error: any) {
       throw new Error(`Add checklist item failed: ${error.message}`);
@@ -275,7 +383,7 @@ mcp.addTool({
     items: z.array(z.string()).describe("Array of checklist item titles"),
   }),
   execute: async ({ taskId, items }) => {
-    const etag = getETag("taskDetails", taskId);
+    const etag = await getETag("taskDetails", taskId);
     const checklist: Record<string, any> = {};
 
     for (const title of items) {
@@ -288,8 +396,9 @@ mcp.addTool({
     }
 
     const body = { checklist };
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;    try {
-      const result = az("PATCH", url, { etag, body: body });
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;
+    try {
+      const result = await graph("PATCH", url, { etag, body: body });
       return result || JSON.stringify({ success: true, itemCount: items.length });
     } catch (error: any) {
       throw new Error(`Add checklist items failed: ${error.message}`);
@@ -308,7 +417,7 @@ mcp.addTool({
     isChecked: z.boolean().optional().describe("Set checked state"),
   }),
   execute: async ({ taskId, itemId, title, isChecked }) => {
-    const etag = getETag("taskDetails", taskId);
+    const etag = await getETag("taskDetails", taskId);
     const itemUpdate: Record<string, any> = {
       "@odata.type": "#microsoft.graph.plannerChecklistItem",
     };
@@ -321,8 +430,9 @@ mcp.addTool({
       },
     };
 
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;    try {
-      const result = az("PATCH", url, { etag, body: body });
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;
+    try {
+      const result = await graph("PATCH", url, { etag, body: body });
       return result || "Checklist item updated successfully";
     } catch (error: any) {
       throw new Error(`Update checklist item failed: ${error.message}`);
@@ -339,15 +449,16 @@ mcp.addTool({
     itemId: z.string().describe("The checklist item ID to delete"),
   }),
   execute: async ({ taskId, itemId }) => {
-    const etag = getETag("taskDetails", taskId);
+    const etag = await getETag("taskDetails", taskId);
     const body = {
       checklist: {
         [itemId]: null,
       },
     };
 
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;    try {
-      const result = az("PATCH", url, { etag, body: body });
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;
+    try {
+      const result = await graph("PATCH", url, { etag, body: body });
       return result || "Checklist item deleted successfully";
     } catch (error: any) {
       throw new Error(`Delete checklist item failed: ${error.message}`);
@@ -363,9 +474,10 @@ mcp.addTool({
     taskId: z.string().describe("The task ID to delete"),
   }),
   execute: async ({ taskId }) => {
-    const etag = getETag("task", taskId);
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;    try {
-      az("DELETE", url, { etag });
+    const etag = await getETag("task", taskId);
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;
+    try {
+      await graph("DELETE", url, { etag });
       return "Task deleted successfully";
     } catch (error: any) {
       throw new Error(`Delete failed: ${error.message}`);
@@ -382,7 +494,7 @@ mcp.addTool({
   }),
   execute: async ({ planId }) => {
     const url = `https://graph.microsoft.com/v1.0/planner/plans/${seg(planId)}/buckets`;
-    return JSON.stringify(azRestGetAll(url), null, 2);
+    return JSON.stringify(await azRestGetAll(url), null, 2);
   },
 });
 
@@ -393,7 +505,7 @@ mcp.addTool({
   parameters: z.object({}),
   execute: async () => {
     const url = "https://graph.microsoft.com/v1.0/me/planner/plans";
-    return JSON.stringify(azRestGetAll(url), null, 2);
+    return JSON.stringify(await azRestGetAll(url), null, 2);
   },
 });
 
@@ -406,7 +518,7 @@ mcp.addTool({
   }),
   execute: async ({ planId }) => {
     const url = `https://graph.microsoft.com/v1.0/planner/plans/${seg(planId)}/details`;
-    const result = azRest("GET", url);
+    const result = await azRest("GET", url);
     return result;
   },
 });
@@ -418,7 +530,7 @@ mcp.addTool({
   parameters: z.object({}),
   execute: async () => {
     const url = "https://graph.microsoft.com/v1.0/me/planner/tasks";
-    return JSON.stringify(azRestGetAll(url), null, 2);
+    return JSON.stringify(await azRestGetAll(url), null, 2);
   },
 });
 
@@ -430,10 +542,10 @@ mcp.addTool({
     planId: z.string().describe("The Planner plan ID (will resolve to the group that owns it)"),
   }),
   execute: async ({ planId }) => {
-    const groupId = getGroupIdFromPlan(planId);
+    const groupId = await getGroupIdFromPlan(planId);
     const url = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/members`;
     // Return simplified list with id and displayName
-    const members = azRestGetAll(url).map((m: any) => ({
+    const members = (await azRestGetAll(url)).map((m: any) => ({
       id: m.id,
       displayName: m.displayName,
       userPrincipalName: m.userPrincipalName,
@@ -454,7 +566,7 @@ mcp.addTool({
   execute: async ({ taskId }) => {
     const url = `https://graph.microsoft.com/beta/planner/tasks/${seg(taskId)}/messages`;
     try {
-      return JSON.stringify(azRestGetAll(url), null, 2);
+      return JSON.stringify(await azRestGetAll(url), null, 2);
     } catch (error: any) {
       if (String(error.message).includes("does not have an associated chat thread")) {
         return JSON.stringify([], null, 2);
@@ -473,9 +585,10 @@ mcp.addTool({
     bucketId: z.string().describe("The target bucket ID"),
   }),
   execute: async ({ taskId, bucketId }) => {
-    const etag = getETag("task", taskId);
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;    try {
-      const result = az("PATCH", url, { etag, body: { bucketId } });
+    const etag = await getETag("task", taskId);
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;
+    try {
+      const result = await graph("PATCH", url, { etag, body: { bucketId } });
       return result || "Task moved successfully";
     } catch (error: any) {
       throw new Error(`Move task failed: ${error.message}`);
@@ -494,7 +607,7 @@ mcp.addTool({
   execute: async ({ planId, name }) => {
     const url = "https://graph.microsoft.com/v1.0/planner/buckets";
     const body = { planId, name, orderHint: " !" };
-    const result = azRest("POST", url, body);
+    const result = await azRest("POST", url, body);
     return result;
   },
 });
@@ -508,9 +621,10 @@ mcp.addTool({
     name: z.string().describe("The new bucket name"),
   }),
   execute: async ({ bucketId, name }) => {
-    const etag = getETag("bucket", bucketId);
-    const url = `https://graph.microsoft.com/v1.0/planner/buckets/${seg(bucketId)}`;    try {
-      const result = az("PATCH", url, { etag, body: { name } });
+    const etag = await getETag("bucket", bucketId);
+    const url = `https://graph.microsoft.com/v1.0/planner/buckets/${seg(bucketId)}`;
+    try {
+      const result = await graph("PATCH", url, { etag, body: { name } });
       return result || "Bucket updated successfully";
     } catch (error: any) {
       throw new Error(`Update bucket failed: ${error.message}`);
@@ -526,9 +640,10 @@ mcp.addTool({
     bucketId: z.string().describe("The bucket ID to delete"),
   }),
   execute: async ({ bucketId }) => {
-    const etag = getETag("bucket", bucketId);
-    const url = `https://graph.microsoft.com/v1.0/planner/buckets/${seg(bucketId)}`;    try {
-      az("DELETE", url, { etag });
+    const etag = await getETag("bucket", bucketId);
+    const url = `https://graph.microsoft.com/v1.0/planner/buckets/${seg(bucketId)}`;
+    try {
+      await graph("DELETE", url, { etag });
       return "Bucket deleted successfully";
     } catch (error: any) {
       throw new Error(`Delete bucket failed: ${error.message}`);
@@ -547,7 +662,7 @@ mcp.addTool({
     type: z.string().optional().describe("Reference type (e.g., 'Other', 'PowerPoint', 'Excel', 'Word', 'Pdf')"),
   }),
   execute: async ({ taskId, url: refUrl, alias, type }) => {
-    const etag = getETag("taskDetails", taskId);
+    const etag = await getETag("taskDetails", taskId);
     const encodedUrl = encodeUrlForReference(refUrl);
 
     const referenceData: Record<string, any> = {
@@ -564,7 +679,7 @@ mcp.addTool({
 
     const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;
     try {
-      const result = azRestPatchWithEtag(url, etag, body);
+      const result = await azRestPatchWithEtag(url, etag, body);
       return result || "Reference added successfully";
     } catch (error: any) {
       throw new Error(`Add reference failed: ${error.message}`);
@@ -581,7 +696,7 @@ mcp.addTool({
     url: z.string().describe("The URL of the reference to delete"),
   }),
   execute: async ({ taskId, url: refUrl }) => {
-    const etag = getETag("taskDetails", taskId);
+    const etag = await getETag("taskDetails", taskId);
     const encodedUrl = encodeUrlForReference(refUrl);
 
     const body = {
@@ -592,7 +707,7 @@ mcp.addTool({
 
     const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;
     try {
-      const result = azRestPatchWithEtag(url, etag, body);
+      const result = await azRestPatchWithEtag(url, etag, body);
       return result || "Reference deleted successfully";
     } catch (error: any) {
       throw new Error(`Delete reference failed: ${error.message}`);
@@ -621,37 +736,32 @@ mcp.addTool({
 
     // Get task to find planId
     const taskUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;
-    const task = JSON.parse(azRest("GET", taskUrl));
+    const task = JSON.parse(await azRest("GET", taskUrl));
 
     // Get groupId from plan
-    const groupId = getGroupIdFromPlan(task.planId);
+    const groupId = await getGroupIdFromPlan(task.planId);
 
     // Get the group's drive (SharePoint document library)
     const driveUrl = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/drive`;
-    const drive = JSON.parse(azRest("GET", driveUrl));
+    const drive = JSON.parse(await azRest("GET", driveUrl));
     const driveId = drive.id;
 
     // Upload file to SharePoint (root of document library, in a "Planner Attachments" folder)
     const folderPath = "Planner Attachments";
     const uploadUrl = `https://graph.microsoft.com/v1.0/drives/${seg(driveId)}/items/root:/${seg(folderPath)}/${seg(fileName)}:/content`;
 
-    // Write file to temp location for az rest to read
-    const tmpFile = join(tmpdir(), `mcp-upload-${randomUUID()}-${fileName}`);
     try {
-      writeFileSync(tmpFile, fileBuffer);
-
-      // Upload using az rest with binary file
-      const uploadResult = JSON.parse(az("PUT", uploadUrl, { bodyFile: tmpFile }));
+      const uploadResult = JSON.parse(await graph("PUT", uploadUrl, { raw: fileBuffer }));
       const fileId = uploadResult.id;
 
       // Create a sharing link for the file (cleaner URL than webUrl)
       const shareLinkUrl = `https://graph.microsoft.com/v1.0/drives/${seg(driveId)}/items/${seg(fileId)}/createLink`;
       const shareLinkBody = { type: "view", scope: "organization" };
-      const shareLinkResult = JSON.parse(azRest("POST", shareLinkUrl, shareLinkBody));
+      const shareLinkResult = JSON.parse(await azRest("POST", shareLinkUrl, shareLinkBody));
       const fileWebUrl = shareLinkResult.link.webUrl;
 
       // Add reference to task
-      const etag = getETag("taskDetails", taskId);
+      const etag = await getETag("taskDetails", taskId);
       const encodedUrl = encodeUrlForReference(fileWebUrl);
       const referenceData: Record<string, any> = {
         "@odata.type": "#microsoft.graph.plannerExternalReference",
@@ -663,7 +773,7 @@ mcp.addTool({
         },
       };
       const detailsUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;
-      azRestPatchWithEtag(detailsUrl, etag, refBody);
+      await azRestPatchWithEtag(detailsUrl, etag, refBody);
 
       return JSON.stringify({
         success: true,
@@ -672,8 +782,8 @@ mcp.addTool({
         sharePointUrl: fileWebUrl,
         message: "File uploaded to SharePoint and attached to task",
       });
-    } finally {
-      try { unlinkSync(tmpFile); } catch {}
+    } catch (error: any) {
+      throw new Error(`Upload failed: ${error.message}`);
     }
   },
 });
