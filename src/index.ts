@@ -1,6 +1,6 @@
 import { FastMCP } from "fastmcp";
 import { z } from "zod";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import { randomUUID } from "crypto";
 import { writeFileSync, unlinkSync, readFileSync } from "fs";
 import { tmpdir } from "os";
@@ -11,19 +11,47 @@ const mcp = new FastMCP({
   version: "1.0.0",
 });
 
-// Helper to execute az rest commands
-function azRest(method: string, url: string, body?: object): string {
-  const args = [`az rest --method ${method} --url "${url}"`];
-  if (body) {
-    const bodyJson = JSON.stringify(body).replace(/"/g, '\\"');
-    args.push(`--headers "Content-Type=application/json" --body "${bodyJson}"`);
+// IDs and names go into URL paths: encode them so a value can never change the endpoint
+// (e.g. "abc/../../users" or "?$select=...").
+const seg = (value: string) => encodeURIComponent(value);
+
+interface AzOptions {
+  body?: object;            // JSON body
+  bodyFile?: string;        // raw body from a file (e.g. upload)
+  etag?: string;            // sent as If-Match
+  contentType?: string;
+}
+
+// Run `az rest` without a shell: arguments are passed as an array, so titles, comments or
+// IDs containing quotes, $(...) or backticks are never interpreted. JSON bodies always go
+// through a temp file, which also avoids any quoting of the payload.
+function az(method: string, url: string, opts: AzOptions = {}): string {
+  const args = ["rest", "--method", method, "--url", url];
+  const headers: string[] = [];
+  let tmpFile: string | undefined;
+  if (opts.body !== undefined) {
+    tmpFile = join(tmpdir(), `mcp-planner-${randomUUID()}.json`);
+    writeFileSync(tmpFile, JSON.stringify(opts.body));
+    headers.push(`Content-Type=${opts.contentType ?? "application/json"}`);
+    args.push("--body", `@${tmpFile}`);
+  } else if (opts.bodyFile) {
+    headers.push(`Content-Type=${opts.contentType ?? "application/octet-stream"}`);
+    args.push("--body", `@${opts.bodyFile}`);
   }
+  if (opts.etag) headers.push(`If-Match=${opts.etag}`);
+  if (headers.length) args.push("--headers", ...headers);
   try {
-    const result = execSync(args.join(" "), { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
-    return result;
+    return execFileSync("az", args, { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
   } catch (error: any) {
-    throw new Error(`az rest failed: ${error.message}`);
+    throw new Error(`az rest failed: ${error.stderr?.toString().trim() || error.message}`);
+  } finally {
+    if (tmpFile) try { unlinkSync(tmpFile); } catch {}
   }
+}
+
+// Kept for the existing call sites
+function azRest(method: string, url: string, body?: object): string {
+  return az(method, url, { body });
 }
 
 // Helper to get ETag for update/delete operations (supports multiple resource types)
@@ -31,9 +59,9 @@ type ResourceType = "task" | "taskDetails" | "bucket";
 
 function getETag(resourceType: ResourceType, resourceId: string): string {
   const urlMap: Record<ResourceType, string> = {
-    task: `https://graph.microsoft.com/v1.0/planner/tasks/${resourceId}`,
-    taskDetails: `https://graph.microsoft.com/v1.0/planner/tasks/${resourceId}/details`,
-    bucket: `https://graph.microsoft.com/v1.0/planner/buckets/${resourceId}`,
+    task: `https://graph.microsoft.com/v1.0/planner/tasks/${seg(resourceId)}`,
+    taskDetails: `https://graph.microsoft.com/v1.0/planner/tasks/${seg(resourceId)}/details`,
+    bucket: `https://graph.microsoft.com/v1.0/planner/buckets/${seg(resourceId)}`,
   };
   const result = JSON.parse(azRest("GET", urlMap[resourceType]));
   return result["@odata.etag"];
@@ -41,7 +69,7 @@ function getETag(resourceType: ResourceType, resourceId: string): string {
 
 // Helper to get groupId from a plan (required for comments and group member listing)
 function getGroupIdFromPlan(planId: string): string {
-  const url = `https://graph.microsoft.com/v1.0/planner/plans/${planId}`;
+  const url = `https://graph.microsoft.com/v1.0/planner/plans/${seg(planId)}`;
   const result = JSON.parse(azRest("GET", url));
   return result.container.containerId;
 }
@@ -60,22 +88,9 @@ function encodeUrlForReference(url: string): string {
     .replace(/=/g, "%3D");    // Encode equals
 }
 
-// Helper for PATCH requests with complex JSON bodies (uses temp file to avoid shell escaping issues)
+// Helper for PATCH requests with an ETag
 function azRestPatchWithEtag(url: string, etag: string, body: object): string {
-  const tmpFile = join(tmpdir(), `mcp-planner-${randomUUID()}.json`);
-  try {
-    writeFileSync(tmpFile, JSON.stringify(body));
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method PATCH --url "${url}"`,
-      `--headers "Content-Type=application/json" "If-Match=${escapedEtag}"`,
-      `--body @${tmpFile}`,
-    ];
-    const result = execSync(args.join(" "), { encoding: "utf-8" });
-    return result;
-  } finally {
-    try { unlinkSync(tmpFile); } catch {}
-  }
+  return az("PATCH", url, { etag, body });
 }
 
 // Tool: List tasks for a plan
@@ -86,7 +101,7 @@ mcp.addTool({
     planId: z.string().describe("The Planner plan ID"),
   }),
   execute: async ({ planId }) => {
-    const url = `https://graph.microsoft.com/v1.0/planner/plans/${planId}/tasks`;
+    const url = `https://graph.microsoft.com/v1.0/planner/plans/${seg(planId)}/tasks`;
     const result = JSON.parse(azRest("GET", url));
     return JSON.stringify(result.value, null, 2);
   },
@@ -100,7 +115,7 @@ mcp.addTool({
     taskId: z.string().describe("The task ID"),
   }),
   execute: async ({ taskId }) => {
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}`;
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;
     const result = azRest("GET", url);
     return result;
   },
@@ -114,7 +129,7 @@ mcp.addTool({
     taskId: z.string().describe("The task ID"),
   }),
   execute: async ({ taskId }) => {
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}/details`;
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;
     const result = azRest("GET", url);
     return result;
   },
@@ -179,16 +194,8 @@ mcp.addTool({
       }
     }
 
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}`;
-    // Escape the inner quotes in the ETag for shell: W/"..." -> W/\"...\"
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method PATCH --url "${url}"`,
-      `--headers "Content-Type=application/json" "If-Match=${escapedEtag}"`,
-      `--body '${JSON.stringify(body)}'`,
-    ];
-    try {
-      const result = execSync(args.join(" "), { encoding: "utf-8" });
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;    try {
+      const result = az("PATCH", url, { etag, body: body });
       return result || "Task updated successfully";
     } catch (error: any) {
       throw new Error(`Update failed: ${error.message}`);
@@ -206,16 +213,8 @@ mcp.addTool({
   }),
   execute: async ({ taskId, description }) => {
     const etag = getETag("taskDetails", taskId);
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}/details`;
-    // Escape the inner quotes in the ETag for shell: W/"..." -> W/\"...\"
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method PATCH --url "${url}"`,
-      `--headers "Content-Type=application/json" "If-Match=${escapedEtag}"`,
-      `--body '${JSON.stringify({ description })}'`,
-    ];
-    try {
-      const result = execSync(args.join(" "), { encoding: "utf-8" });
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;    try {
+      const result = az("PATCH", url, { etag, body: { description } });
       return result || "Task details updated successfully";
     } catch (error: any) {
       throw new Error(`Update details failed: ${error.message}`);
@@ -245,15 +244,8 @@ mcp.addTool({
       },
     };
 
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}/details`;
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method PATCH --url "${url}"`,
-      `--headers "Content-Type=application/json" "If-Match=${escapedEtag}"`,
-      `--body '${JSON.stringify(body)}'`,
-    ];
-    try {
-      const result = execSync(args.join(" "), { encoding: "utf-8" });
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;    try {
+      const result = az("PATCH", url, { etag, body: body });
       return result || JSON.stringify({ success: true, itemId, title });
     } catch (error: any) {
       throw new Error(`Add checklist item failed: ${error.message}`);
@@ -283,15 +275,8 @@ mcp.addTool({
     }
 
     const body = { checklist };
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}/details`;
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method PATCH --url "${url}"`,
-      `--headers "Content-Type=application/json" "If-Match=${escapedEtag}"`,
-      `--body '${JSON.stringify(body)}'`,
-    ];
-    try {
-      const result = execSync(args.join(" "), { encoding: "utf-8" });
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;    try {
+      const result = az("PATCH", url, { etag, body: body });
       return result || JSON.stringify({ success: true, itemCount: items.length });
     } catch (error: any) {
       throw new Error(`Add checklist items failed: ${error.message}`);
@@ -323,15 +308,8 @@ mcp.addTool({
       },
     };
 
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}/details`;
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method PATCH --url "${url}"`,
-      `--headers "Content-Type=application/json" "If-Match=${escapedEtag}"`,
-      `--body '${JSON.stringify(body)}'`,
-    ];
-    try {
-      const result = execSync(args.join(" "), { encoding: "utf-8" });
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;    try {
+      const result = az("PATCH", url, { etag, body: body });
       return result || "Checklist item updated successfully";
     } catch (error: any) {
       throw new Error(`Update checklist item failed: ${error.message}`);
@@ -355,15 +333,8 @@ mcp.addTool({
       },
     };
 
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}/details`;
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method PATCH --url "${url}"`,
-      `--headers "Content-Type=application/json" "If-Match=${escapedEtag}"`,
-      `--body '${JSON.stringify(body)}'`,
-    ];
-    try {
-      const result = execSync(args.join(" "), { encoding: "utf-8" });
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;    try {
+      const result = az("PATCH", url, { etag, body: body });
       return result || "Checklist item deleted successfully";
     } catch (error: any) {
       throw new Error(`Delete checklist item failed: ${error.message}`);
@@ -380,15 +351,8 @@ mcp.addTool({
   }),
   execute: async ({ taskId }) => {
     const etag = getETag("task", taskId);
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}`;
-    // Escape the inner quotes in the ETag for shell: W/"..." -> W/\"...\"
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method DELETE --url "${url}"`,
-      `--headers "If-Match=${escapedEtag}"`,
-    ];
-    try {
-      execSync(args.join(" "), { encoding: "utf-8" });
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;    try {
+      az("DELETE", url, { etag });
       return "Task deleted successfully";
     } catch (error: any) {
       throw new Error(`Delete failed: ${error.message}`);
@@ -404,7 +368,7 @@ mcp.addTool({
     planId: z.string().describe("The Planner plan ID"),
   }),
   execute: async ({ planId }) => {
-    const url = `https://graph.microsoft.com/v1.0/planner/plans/${planId}/buckets`;
+    const url = `https://graph.microsoft.com/v1.0/planner/plans/${seg(planId)}/buckets`;
     const result = JSON.parse(azRest("GET", url));
     return JSON.stringify(result.value, null, 2);
   },
@@ -430,7 +394,7 @@ mcp.addTool({
     planId: z.string().describe("The Planner plan ID"),
   }),
   execute: async ({ planId }) => {
-    const url = `https://graph.microsoft.com/v1.0/planner/plans/${planId}/details`;
+    const url = `https://graph.microsoft.com/v1.0/planner/plans/${seg(planId)}/details`;
     const result = azRest("GET", url);
     return result;
   },
@@ -457,7 +421,7 @@ mcp.addTool({
   }),
   execute: async ({ planId }) => {
     const groupId = getGroupIdFromPlan(planId);
-    const url = `https://graph.microsoft.com/v1.0/groups/${groupId}/members`;
+    const url = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/members`;
     const result = JSON.parse(azRest("GET", url));
     // Return simplified list with id and displayName
     const members = result.value.map((m: any) => ({
@@ -478,7 +442,7 @@ mcp.addTool({
   }),
   execute: async ({ taskId }) => {
     // Get task to find conversationThreadId and planId
-    const taskUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}`;
+    const taskUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;
     const task = JSON.parse(azRest("GET", taskUrl));
 
     if (!task.conversationThreadId) {
@@ -488,13 +452,13 @@ mcp.addTool({
     const groupId = getGroupIdFromPlan(task.planId);
 
     // Planner's conversationThreadId is a conversation ID - get threads from it, then posts
-    const threadsUrl = `https://graph.microsoft.com/v1.0/groups/${groupId}/conversations/${task.conversationThreadId}/threads`;
+    const threadsUrl = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/conversations/${seg(task.conversationThreadId)}/threads`;
     const threadsResult = JSON.parse(azRest("GET", threadsUrl));
 
     // Collect posts from all threads
     const comments: any[] = [];
     for (const thread of threadsResult.value) {
-      const postsUrl = `https://graph.microsoft.com/v1.0/groups/${groupId}/conversations/${task.conversationThreadId}/threads/${thread.id}/posts`;
+      const postsUrl = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/conversations/${seg(task.conversationThreadId)}/threads/${seg(thread.id)}/posts`;
       const postsResult = JSON.parse(azRest("GET", postsUrl));
 
       for (const post of postsResult.value) {
@@ -523,13 +487,13 @@ mcp.addTool({
   }),
   execute: async ({ taskId, comment }) => {
     // Get task to find conversationThreadId and planId
-    const taskUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}`;
+    const taskUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;
     const task = JSON.parse(azRest("GET", taskUrl));
     const groupId = getGroupIdFromPlan(task.planId);
 
     if (task.conversationThreadId) {
       // Reply to existing conversation - need to get the thread ID first
-      const threadsUrl = `https://graph.microsoft.com/v1.0/groups/${groupId}/conversations/${task.conversationThreadId}/threads`;
+      const threadsUrl = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/conversations/${seg(task.conversationThreadId)}/threads`;
       const threadsResult = JSON.parse(azRest("GET", threadsUrl));
 
       if (!threadsResult.value || threadsResult.value.length === 0) {
@@ -537,7 +501,7 @@ mcp.addTool({
       }
 
       const threadId = threadsResult.value[0].id;
-      const replyUrl = `https://graph.microsoft.com/v1.0/groups/${groupId}/conversations/${task.conversationThreadId}/threads/${threadId}/reply`;
+      const replyUrl = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/conversations/${seg(task.conversationThreadId)}/threads/${seg(threadId)}/reply`;
       const body = {
         post: {
           body: {
@@ -550,7 +514,7 @@ mcp.addTool({
       return JSON.stringify({ success: true, message: "Comment added to existing thread" });
     } else {
       // Create new conversation (POST to threads creates a conversation with initial thread)
-      const threadsUrl = `https://graph.microsoft.com/v1.0/groups/${groupId}/threads`;
+      const threadsUrl = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/threads`;
       const threadBody = {
         topic: task.title,
         posts: [
@@ -568,15 +532,9 @@ mcp.addTool({
 
       // Update task with the conversation ID
       const etag = getETag("task", taskId);
-      const escapedEtag = etag.replace(/"/g, '\\"');
-      const updateUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}`;
-      const args = [
-        `az rest --method PATCH --url "${updateUrl}"`,
-        `--headers "Content-Type=application/json" "If-Match=${escapedEtag}"`,
-        `--body '${JSON.stringify({ conversationThreadId: conversationId })}'`,
-      ];
+      const updateUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;
       try {
-        execSync(args.join(" "), { encoding: "utf-8" });
+        az("PATCH", updateUrl, { etag, body: { conversationThreadId: conversationId } });
       } catch (error: any) {
         // Thread was created but task update may fail - comment still exists
         return JSON.stringify({
@@ -600,15 +558,8 @@ mcp.addTool({
   }),
   execute: async ({ taskId, bucketId }) => {
     const etag = getETag("task", taskId);
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}`;
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method PATCH --url "${url}"`,
-      `--headers "Content-Type=application/json" "If-Match=${escapedEtag}"`,
-      `--body '${JSON.stringify({ bucketId })}'`,
-    ];
-    try {
-      const result = execSync(args.join(" "), { encoding: "utf-8" });
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;    try {
+      const result = az("PATCH", url, { etag, body: { bucketId } });
       return result || "Task moved successfully";
     } catch (error: any) {
       throw new Error(`Move task failed: ${error.message}`);
@@ -642,15 +593,8 @@ mcp.addTool({
   }),
   execute: async ({ bucketId, name }) => {
     const etag = getETag("bucket", bucketId);
-    const url = `https://graph.microsoft.com/v1.0/planner/buckets/${bucketId}`;
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method PATCH --url "${url}"`,
-      `--headers "Content-Type=application/json" "If-Match=${escapedEtag}"`,
-      `--body '${JSON.stringify({ name })}'`,
-    ];
-    try {
-      const result = execSync(args.join(" "), { encoding: "utf-8" });
+    const url = `https://graph.microsoft.com/v1.0/planner/buckets/${seg(bucketId)}`;    try {
+      const result = az("PATCH", url, { etag, body: { name } });
       return result || "Bucket updated successfully";
     } catch (error: any) {
       throw new Error(`Update bucket failed: ${error.message}`);
@@ -667,14 +611,8 @@ mcp.addTool({
   }),
   execute: async ({ bucketId }) => {
     const etag = getETag("bucket", bucketId);
-    const url = `https://graph.microsoft.com/v1.0/planner/buckets/${bucketId}`;
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method DELETE --url "${url}"`,
-      `--headers "If-Match=${escapedEtag}"`,
-    ];
-    try {
-      execSync(args.join(" "), { encoding: "utf-8" });
+    const url = `https://graph.microsoft.com/v1.0/planner/buckets/${seg(bucketId)}`;    try {
+      az("DELETE", url, { etag });
       return "Bucket deleted successfully";
     } catch (error: any) {
       throw new Error(`Delete bucket failed: ${error.message}`);
@@ -708,7 +646,7 @@ mcp.addTool({
       },
     };
 
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}/details`;
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;
     try {
       const result = azRestPatchWithEtag(url, etag, body);
       return result || "Reference added successfully";
@@ -736,7 +674,7 @@ mcp.addTool({
       },
     };
 
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}/details`;
+    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;
     try {
       const result = azRestPatchWithEtag(url, etag, body);
       return result || "Reference deleted successfully";
@@ -766,20 +704,20 @@ mcp.addTool({
     }
 
     // Get task to find planId
-    const taskUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}`;
+    const taskUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}`;
     const task = JSON.parse(azRest("GET", taskUrl));
 
     // Get groupId from plan
     const groupId = getGroupIdFromPlan(task.planId);
 
     // Get the group's drive (SharePoint document library)
-    const driveUrl = `https://graph.microsoft.com/v1.0/groups/${groupId}/drive`;
+    const driveUrl = `https://graph.microsoft.com/v1.0/groups/${seg(groupId)}/drive`;
     const drive = JSON.parse(azRest("GET", driveUrl));
     const driveId = drive.id;
 
     // Upload file to SharePoint (root of document library, in a "Planner Attachments" folder)
     const folderPath = "Planner Attachments";
-    const uploadUrl = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/root:/${folderPath}/${fileName}:/content`;
+    const uploadUrl = `https://graph.microsoft.com/v1.0/drives/${seg(driveId)}/items/root:/${seg(folderPath)}/${seg(fileName)}:/content`;
 
     // Write file to temp location for az rest to read
     const tmpFile = join(tmpdir(), `mcp-upload-${randomUUID()}-${fileName}`);
@@ -787,16 +725,11 @@ mcp.addTool({
       writeFileSync(tmpFile, fileBuffer);
 
       // Upload using az rest with binary file
-      const args = [
-        `az rest --method PUT --url "${uploadUrl}"`,
-        `--headers "Content-Type=application/octet-stream"`,
-        `--body @${tmpFile}`,
-      ];
-      const uploadResult = JSON.parse(execSync(args.join(" "), { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 }));
+      const uploadResult = JSON.parse(az("PUT", uploadUrl, { bodyFile: tmpFile }));
       const fileId = uploadResult.id;
 
       // Create a sharing link for the file (cleaner URL than webUrl)
-      const shareLinkUrl = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${fileId}/createLink`;
+      const shareLinkUrl = `https://graph.microsoft.com/v1.0/drives/${seg(driveId)}/items/${seg(fileId)}/createLink`;
       const shareLinkBody = { type: "view", scope: "organization" };
       const shareLinkResult = JSON.parse(azRest("POST", shareLinkUrl, shareLinkBody));
       const fileWebUrl = shareLinkResult.link.webUrl;
@@ -813,7 +746,7 @@ mcp.addTool({
           [encodedUrl]: referenceData,
         },
       };
-      const detailsUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}/details`;
+      const detailsUrl = `https://graph.microsoft.com/v1.0/planner/tasks/${seg(taskId)}/details`;
       azRestPatchWithEtag(detailsUrl, etag, refBody);
 
       return JSON.stringify({
